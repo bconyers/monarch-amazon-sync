@@ -59,15 +59,28 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
           func: () => localStorage['persist:root'],
         });
         try {
-          const key = JSON.parse(JSON.parse(result[0].result).user).token;
+          // Add detailed logging for debugging
+          await debugLog(`Raw localStorage result length: ${result[0].result?.length || 0}`);
+
+          const parsedRoot = JSON.parse(result[0].result);
+          await debugLog(`Parsed root keys: ${Object.keys(parsedRoot).join(', ')}`);
+
+          const parsedUser = JSON.parse(parsedRoot.user);
+          await debugLog(`Parsed user keys: ${Object.keys(parsedUser).join(', ')}`);
+
+          const key = parsedUser.token;
+          await debugLog(`Extracted token (first 10 chars): ${key?.substring(0, 10) || 'no token'}...`);
+
           if (key) {
             await appStorage.patch({ monarchKey: key, lastMonarchAuth: Date.now(), monarchStatus: AuthStatus.Success });
+            await debugLog('Successfully stored Monarch token');
           } else {
             await appStorage.patch({ monarchStatus: AuthStatus.NotLoggedIn });
+            await debugLog('No token found in localStorage');
           }
         } catch (ex) {
           await appStorage.patch({ monarchStatus: AuthStatus.Failure });
-          debugLog(ex);
+          await debugLog(`Error parsing localStorage: ${ex instanceof Error ? ex.message : String(ex)}`);
         }
       }
     }
@@ -141,13 +154,65 @@ async function logSyncComplete(payload: Partial<LastSync>) {
   });
 }
 
+async function refreshMonarchToken() {
+  await debugLog('Attempting to refresh Monarch token...');
+
+  // Find a Monarch tab if one exists
+  const monarchTabs = await chrome.tabs.query({ url: 'https://app.monarchmoney.com/*' });
+
+  if (monarchTabs.length > 0 && monarchTabs[0].id !== undefined) {
+    const tabId = monarchTabs[0].id;
+
+    try {
+      const result = await chrome.scripting.executeScript({
+        target: { tabId: tabId },
+        func: () => localStorage['persist:root'],
+      });
+
+      // Add detailed logging for debugging the token
+      if (result[0].result) {
+        await debugLog(`Raw localStorage result length: ${result[0].result.length}`);
+
+        const parsedRoot = JSON.parse(result[0].result);
+        await debugLog(`Parsed root keys: ${Object.keys(parsedRoot).join(', ')}`);
+
+        const parsedUser = JSON.parse(parsedRoot.user);
+        await debugLog(`Parsed user keys: ${Object.keys(parsedUser).join(', ')}`);
+
+        const key = parsedUser.token;
+        await debugLog(`Extracted token (first 10 chars): ${key?.substring(0, 10) || 'no token'}...`);
+
+        if (key) {
+          await appStorage.patch({ monarchKey: key, lastMonarchAuth: Date.now(), monarchStatus: AuthStatus.Success });
+          await debugLog('Successfully refreshed Monarch token');
+          return true;
+        }
+      } else {
+        await debugLog('No result from script execution');
+      }
+    } catch (ex) {
+      await debugLog(`Failed to refresh token: ${ex instanceof Error ? ex.message : String(ex)}`);
+    }
+  } else {
+    await debugLog('No open Monarch tabs found for token refresh or tab ID was undefined');
+  }
+
+  return false;
+}
+
 async function downloadAndStoreTransactions(yearString?: string, dryRun: boolean = false) {
   await debugStorage.set({ logs: [] });
 
   const appData = await appStorage.get();
   const year = yearString ? parseInt(yearString) : undefined;
 
-  if (!appData.monarchKey) {
+  // Try to refresh the token first
+  await refreshMonarchToken();
+
+  // Get updated app data after refresh attempt
+  const updatedAppData = await appStorage.get();
+
+  if (!updatedAppData.monarchKey) {
     await logSyncComplete({ success: false, failureReason: FailureReason.NoMonarchAuth });
     return false;
   }
@@ -188,16 +253,34 @@ async function downloadAndStoreTransactions(yearString?: string, dryRun: boolean
     endDate.setDate(startDate.getDate() + 8);
   }
 
+  // Use updatedAppData instead of appData for the API call
   let monarchTransactions: MonarchTransaction[];
   try {
     await debugLog('Fetching Monarch transactions');
-    monarchTransactions = await getTransactions(appData.monarchKey, appData.options.amazonMerchant, startDate, endDate);
+    // Make sure we're using the refreshed token from updatedAppData
+    monarchTransactions = await getTransactions(
+      updatedAppData.monarchKey,
+      updatedAppData.options.amazonMerchant,
+      startDate,
+      endDate,
+    );
     if (!monarchTransactions || monarchTransactions.length === 0) {
+      await debugLog('No Monarch transactions found');
       await logSyncComplete({ success: false, failureReason: FailureReason.NoMonarchTransactions });
       return false;
     }
   } catch (ex) {
-    await debugLog(ex);
+    await debugLog(`Monarch API error: ${ex instanceof Error ? ex.message : String(ex)}`);
+
+    // Check for auth errors specifically and update the status
+    if (ex instanceof Error && ex.message.includes('401')) {
+      await debugLog('Monarch authentication failed - token is invalid');
+      await appStorage.patch({ monarchStatus: AuthStatus.NotLoggedIn });
+      await logSyncComplete({ success: false, failureReason: FailureReason.NoMonarchAuth });
+      return false;
+    }
+
+    // Other error handling...
     await logSyncComplete({ success: false, failureReason: FailureReason.MonarchError });
     return false;
   }
