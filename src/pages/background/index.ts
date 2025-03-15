@@ -329,6 +329,13 @@ async function updateMonarchTransactions() {
 
   for (const data of matches) {
     const itemString = data.items
+      .filter(item => {
+        if (!item.price) {
+          debugLog(`item ${item.title} has an unknown price.`);
+          return false;
+        }
+        return true;
+      })
       .map(item => {
         return item.quantity + 'x ' + item.title + ' - $' + item.price.toFixed(2);
       })
